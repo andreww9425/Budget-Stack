@@ -73,10 +73,28 @@ extension View {
     func enableSwipeBack() -> some View {
         background(SwipeBackEnabler().frame(width: 0, height: 0))
     }
+
+    func iPadReadableWidth(_ maxWidth: CGFloat = 760) -> some View {
+        modifier(IPadReadableWidthModifier(maxWidth: maxWidth))
+    }
+}
+
+private struct IPadReadableWidthModifier: ViewModifier {
+    let maxWidth: CGFloat
+
+    func body(content: Content) -> some View {
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            content
+                .frame(maxWidth: maxWidth)
+                .frame(maxWidth: .infinity, alignment: .center)
+        } else {
+            content
+        }
+    }
 }
 
 struct CleanIconButton<Label: View>: View {
-    var size: CGFloat = 48
+    var size: CGFloat = 42
     let action: () -> Void
     @ViewBuilder let label: Label
 
@@ -139,6 +157,7 @@ struct BudgetSnapTopBar: View {
         .padding(.top, 14)
         .padding(.bottom, 10)
         .background(.clear)
+        .iPadReadableWidth(820)
     }
 }
 
@@ -168,6 +187,7 @@ struct ListsTopBar: View {
         .padding(.top, 22)
         .padding(.bottom, 2)
         .background(.clear)
+        .iPadReadableWidth()
     }
 }
 
@@ -177,48 +197,49 @@ struct SpendListRow: View {
     let onDelete: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 18) {
+        HStack(alignment: .center, spacing: 14) {
             if isEditing {
                 Button(role: .destructive, action: onDelete) {
                     Image(systemName: "minus.circle.fill")
-                        .font(.system(size: 28, weight: .regular))
+                        .font(.title2)
                         .foregroundStyle(.red)
                 }
                 .buttonStyle(.plain)
                 .transition(.scale.combined(with: .opacity))
             }
 
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 7) {
                 Text(list.title)
-                    .font(.title2.weight(.bold))
+                    .font(.headline.weight(.bold))
                     .foregroundStyle(BudgetSnapTheme.primaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 12) {
                     Text("\(list.itemCount) items")
-                        .font(.title3)
+                        .font(.subheadline)
                         .foregroundStyle(BudgetSnapTheme.secondaryText)
 
                     if list.isShared {
                         Image(systemName: "person.2.fill")
-                            .font(.system(size: 16, weight: .bold))
+                            .font(.caption.weight(.bold))
                             .foregroundStyle(BudgetSnapTheme.secondaryText)
                     }
                 }
             }
-
-            Spacer(minLength: 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(list.total, format: .currency(code: Locale.current.currency?.identifier ?? "USD"))
-                .font(.title2.weight(.bold))
+                .font(.headline.weight(.bold))
                 .foregroundStyle(BudgetSnapTheme.primaryText)
                 .monospacedDigit()
                 .lineLimit(1)
-                .minimumScaleFactor(0.74)
+                .minimumScaleFactor(0.75)
+                .layoutPriority(1)
         }
         .padding(.horizontal, 26)
-        .frame(height: 136)
+        .padding(.vertical, 18)
+        .frame(minHeight: 104)
         .contentShape(Rectangle())
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -306,6 +327,10 @@ struct BudgetSnapCategorySection: View {
     let isCollapsed: Bool
     let onToggleSection: () -> Void
     let onToggleTransaction: (Transaction.ID) -> Void
+    let onDuplicateTransaction: (Transaction.ID) -> Void
+    let onDeleteTransaction: (Transaction.ID) -> Void
+    let onMoveTransaction: (Transaction.ID) -> Void
+    let onOpenTransaction: (Transaction) -> Void
     let isSelecting: Bool
     let selectedTransactionIDs: Set<Transaction.ID>
     let onSelectTransaction: (Transaction.ID) -> Void
@@ -315,37 +340,51 @@ struct BudgetSnapCategorySection: View {
             Button(action: onToggleSection) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(section.category.name)
-                        .font(.title2.weight(.bold))
+                        .font(.title3.weight(.bold))
                         .foregroundStyle(BudgetSnapTheme.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
 
                     Spacer()
 
                     Text(section.total, format: .currency(code: Locale.current.currency?.identifier ?? "USD"))
-                        .font(.title2.weight(.bold))
+                        .font(.title3.weight(.bold))
                         .foregroundStyle(BudgetSnapTheme.primaryText)
                         .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
 
                     Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
-                        .font(.system(size: 22, weight: .bold))
+                        .font(.title3.weight(.bold))
                         .foregroundStyle(BudgetSnapTheme.accent)
-                        .frame(width: 34)
+                        .frame(width: 28)
                 }
                 .padding(.horizontal, 28)
-                .padding(.bottom, isCollapsed ? 0 : 22)
+                .padding(.bottom, isCollapsed ? 0 : 12)
             }
             .buttonStyle(.plain)
 
             if !isCollapsed {
                 VStack(spacing: 0) {
                     ForEach(section.transactions) { transaction in
-                        BudgetSnapTransactionRow(
-                            transaction: transaction,
-                            category: section.category,
-                            isSelecting: isSelecting,
-                            isSelected: selectedTransactionIDs.contains(transaction.id),
-                            onToggle: { onToggleTransaction(transaction.id) },
-                            onSelect: { onSelectTransaction(transaction.id) }
-                        )
+                        SwipeActionRow(
+                            isEnabled: !isSelecting,
+                            onDuplicate: { onDuplicateTransaction(transaction.id) },
+                            onDelete: { onDeleteTransaction(transaction.id) }
+                        ) {
+                            BudgetSnapTransactionRow(
+                                transaction: transaction,
+                                category: section.category,
+                                isSelecting: isSelecting,
+                                isSelected: selectedTransactionIDs.contains(transaction.id),
+                                onToggle: { onToggleTransaction(transaction.id) },
+                                onSelect: { onSelectTransaction(transaction.id) },
+                                onDuplicate: { onDuplicateTransaction(transaction.id) },
+                                onMove: { onMoveTransaction(transaction.id) },
+                                onDelete: { onDeleteTransaction(transaction.id) },
+                                onOpen: { onOpenTransaction(transaction) }
+                            )
+                        }
                     }
                 }
             }
@@ -360,31 +399,35 @@ struct BudgetSnapTransactionRow: View {
     let isSelected: Bool
     let onToggle: () -> Void
     let onSelect: () -> Void
+    let onDuplicate: () -> Void
+    let onMove: () -> Void
+    let onDelete: () -> Void
+    let onOpen: () -> Void
 
     private var isMarked: Bool {
         isSelecting ? isSelected : transaction.isChecked
     }
 
     var body: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 12) {
             RoundedRectangle(cornerRadius: 4, style: .continuous)
                 .fill(category.tint)
-                .frame(width: 10)
-                .padding(.vertical, 6)
+                .frame(width: 8)
+                .padding(.vertical, 4)
 
             Button(action: isSelecting ? onSelect : onToggle) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(isMarked ? BudgetSnapTheme.accent : BudgetSnapTheme.uncheckedStroke, lineWidth: 3)
+                        .stroke(isMarked ? BudgetSnapTheme.accent : BudgetSnapTheme.uncheckedStroke, lineWidth: 2.5)
                         .background {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .fill(isMarked ? BudgetSnapTheme.accent : .clear)
                         }
-                        .frame(width: 34, height: 34)
+                        .frame(width: 28, height: 28)
 
                     if isMarked {
                         Image(systemName: "checkmark")
-                            .font(.system(size: 24, weight: .bold))
+                            .font(.body.weight(.bold))
                             .foregroundStyle(BudgetSnapTheme.background)
                     }
                 }
@@ -393,32 +436,64 @@ struct BudgetSnapTransactionRow: View {
             .accessibilityLabel(accessibilityLabel)
 
             Text(transaction.title)
-                .font(.title3)
+                .font(.body)
                 .foregroundStyle(BudgetSnapTheme.primaryText)
                 .lineLimit(1)
-                .minimumScaleFactor(0.72)
+                .minimumScaleFactor(0.8)
 
-            Spacer(minLength: 12)
+            Spacer(minLength: 8)
 
-            Text(transaction.amount, format: .currency(code: Locale.current.currency?.identifier ?? "USD"))
-                .font(.title3)
-                .foregroundStyle(BudgetSnapTheme.primaryText)
-                .monospacedDigit()
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(transaction.amount, format: .currency(code: Locale.current.currency?.identifier ?? "USD"))
+                    .font(.body)
+                    .foregroundStyle(BudgetSnapTheme.primaryText)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+
+                if transaction.recurrence.isRecurring {
+                    Text("recurring")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(BudgetSnapTheme.secondaryText)
+                        .lineLimit(1)
+                }
+            }
         }
-        .frame(height: 98)
+        .padding(.leading, 0)
+        .padding(.trailing, 22)
+        .frame(minHeight: 70)
         .contentShape(Rectangle())
         .onTapGesture {
             if isSelecting {
                 onSelect()
+            } else {
+                onOpen()
+            }
+        }
+        .contextMenu {
+            Button {
+                onDuplicate()
+            } label: {
+                Label("Duplicate", systemImage: "plus.square.on.square")
+            }
+
+            Button {
+                onMove()
+            } label: {
+                Label("Move", systemImage: "tag")
+            }
+
+            Button(role: .destructive) {
+                onDelete()
+            } label: {
+                Label("Delete", systemImage: "trash")
             }
         }
         .overlay(alignment: .bottomTrailing) {
             Rectangle()
                 .fill(BudgetSnapTheme.separator)
                 .frame(height: 1)
-                .padding(.leading, 78)
+                .padding(.leading, 68)
         }
     }
 
@@ -428,6 +503,126 @@ struct BudgetSnapTransactionRow: View {
         }
 
         return transaction.isChecked ? "Mark unchecked" : "Mark checked"
+    }
+}
+
+struct SwipeActionRow<Content: View>: View {
+    var isEnabled = true
+    let onDuplicate: (() -> Void)?
+    let onDelete: () -> Void
+    @ViewBuilder let content: Content
+
+    @State private var offset: CGFloat = 0
+    @GestureState private var dragTranslation: CGFloat = 0
+
+    private let actionWidth: CGFloat = 84
+    private let horizontalStartThreshold: CGFloat = 24
+    private let horizontalDominanceRatio: CGFloat = 1.9
+
+    private var currentOffset: CGFloat {
+        guard isEnabled else { return 0 }
+        let minimumOffset = -actionWidth
+        let maximumOffset = onDuplicate == nil ? 0 : actionWidth
+        return max(minimumOffset, min(maximumOffset, offset + dragTranslation))
+    }
+
+    var body: some View {
+        ZStack {
+            HStack(spacing: 0) {
+                if let onDuplicate {
+                    Button {
+                        close()
+                        onDuplicate()
+                    } label: {
+                        Image(systemName: "plus.square.on.square")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: actionWidth)
+                            .frame(maxHeight: .infinity)
+                            .background(BudgetSnapTheme.accent)
+                    }
+                    .accessibilityLabel("Duplicate")
+                }
+
+                Spacer(minLength: 0)
+
+                Button(role: .destructive) {
+                    close()
+                    onDelete()
+                } label: {
+                    Image(systemName: "trash.fill")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: actionWidth)
+                        .frame(maxHeight: .infinity)
+                        .background(.red)
+                }
+                .accessibilityLabel("Delete")
+            }
+
+            content
+                .background(BudgetSnapTheme.background)
+                .offset(x: currentOffset)
+                .gesture(
+                    DragGesture(minimumDistance: 22, coordinateSpace: .local)
+                        .updating($dragTranslation) { value, state, _ in
+                            guard isEnabled, isHorizontalActionGesture(value) else { return }
+                            let translation = offset == 0 ? allowedOpeningTranslation(value.translation.width) : value.translation.width
+                            state = translation
+                        }
+                        .onEnded { value in
+                            guard isEnabled else { return }
+                            guard isHorizontalActionGesture(value) else {
+                                close()
+                                return
+                            }
+
+                            let predicted = offset + value.predictedEndTranslation.width
+                            let nextOffset: CGFloat
+                            if predicted < -actionWidth * 0.58 {
+                                nextOffset = -actionWidth
+                            } else if onDuplicate != nil && predicted > actionWidth * 0.58 {
+                                nextOffset = actionWidth
+                            } else {
+                                nextOffset = 0
+                            }
+
+                            withAnimation(.easeOut(duration: 0.28)) {
+                                offset = nextOffset
+                            }
+                        }
+                )
+                .onChange(of: isEnabled) { _, newValue in
+                    if !newValue {
+                        close()
+                    }
+                }
+        }
+        .clipped()
+    }
+
+    private func close() {
+        withAnimation(.easeOut(duration: 0.24)) {
+            offset = 0
+        }
+    }
+
+    private func allowedOpeningTranslation(_ width: CGFloat) -> CGFloat {
+        if width < 0 {
+            return width
+        }
+
+        return onDuplicate == nil ? 0 : width
+    }
+
+    private func isHorizontalActionGesture(_ value: DragGesture.Value) -> Bool {
+        let width = value.translation.width
+        let height = value.translation.height
+        let isClearHorizontalDrag = abs(width) > max(horizontalStartThreshold, abs(height) * horizontalDominanceRatio)
+        let isOpeningLeft = offset == 0 && width < -horizontalStartThreshold
+        let isOpeningRight = offset == 0 && onDuplicate != nil && width > horizontalStartThreshold
+        let isAdjustingOpenRow = offset != 0
+        return isClearHorizontalDrag && (isOpeningLeft || isOpeningRight || isAdjustingOpenRow)
     }
 }
 
@@ -442,7 +637,7 @@ struct TransactionBottomBar: View {
         HStack {
             CleanIconButton(action: onSort) {
                 Image(systemName: "arrow.up.arrow.down.circle")
-                    .font(.system(size: 32, weight: .regular))
+                    .font(.title2)
             }
             .accessibilityLabel("Sort transactions by \(sortMode.label)")
 
@@ -450,7 +645,7 @@ struct TransactionBottomBar: View {
 
             CleanIconButton(action: onCalendar) {
                 Image(systemName: "calendar")
-                    .font(.system(size: 32, weight: .regular))
+                    .font(.title2)
             }
             .accessibilityLabel("Show transaction calendar")
 
@@ -458,23 +653,24 @@ struct TransactionBottomBar: View {
 
             CleanIconButton(action: onChart) {
                 Image(systemName: "chart.pie")
-                    .font(.system(size: 32, weight: .regular))
+                    .font(.title2)
             }
             .accessibilityLabel("Show tag spending chart")
 
             Spacer()
 
-            CleanIconButton(size: 54, action: onAdd) {
+            CleanIconButton(size: 48, action: onAdd) {
                 Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 42, weight: .regular))
+                    .font(.title)
             }
             .accessibilityLabel("Add transaction")
         }
         .foregroundStyle(BudgetSnapTheme.accent)
-        .padding(.horizontal, 34)
-        .padding(.top, 14)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 32)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
         .background(.clear)
+        .iPadReadableWidth(820)
     }
 }
 
@@ -488,7 +684,7 @@ struct TransactionSelectionBottomBar: View {
         HStack(spacing: 18) {
             CleanIconButton(action: onDelete) {
                 Image(systemName: "trash")
-                    .font(.system(size: 30, weight: .regular))
+                    .font(.title2)
             }
             .disabled(selectedCount == 0)
             .opacity(selectedCount == 0 ? 0.35 : 1)
@@ -496,7 +692,7 @@ struct TransactionSelectionBottomBar: View {
 
             CleanIconButton(action: onMove) {
                 Image(systemName: "tag")
-                    .font(.system(size: 30, weight: .regular))
+                    .font(.title2)
             }
             .disabled(selectedCount == 0)
             .opacity(selectedCount == 0 ? 0.35 : 1)
@@ -505,23 +701,26 @@ struct TransactionSelectionBottomBar: View {
             Spacer()
 
             Text("\(selectedCount) selected")
-                .font(.headline.weight(.bold))
+                .font(.subheadline.weight(.bold))
                 .foregroundStyle(BudgetSnapTheme.secondaryText)
                 .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
 
             Spacer()
 
             CleanIconButton(action: onDone) {
                 Image(systemName: "checkmark.circle")
-                    .font(.system(size: 32, weight: .regular))
+                    .font(.title2)
             }
             .accessibilityLabel("Done selecting")
         }
         .foregroundStyle(BudgetSnapTheme.accent)
-        .padding(.horizontal, 28)
-        .padding(.top, 14)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 26)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
         .background(.clear)
+        .iPadReadableWidth(820)
     }
 }
 
@@ -535,7 +734,7 @@ struct ListsBottomBar: View {
         HStack {
             CleanIconButton(action: onSort) {
                 Image(systemName: "arrow.up.arrow.down.circle")
-                    .font(.system(size: 32, weight: .regular))
+                    .font(.title2)
             }
             .accessibilityLabel("Sort lists by \(sortMode.label)")
 
@@ -543,23 +742,24 @@ struct ListsBottomBar: View {
 
             CleanIconButton(action: onTags) {
                 Image(systemName: "tag.circle")
-                    .font(.system(size: 32, weight: .regular))
+                    .font(.title2)
             }
             .accessibilityLabel("Manage tags")
 
             Spacer()
 
-            CleanIconButton(size: 54, action: onAdd) {
+            CleanIconButton(size: 48, action: onAdd) {
                 Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 42, weight: .regular))
+                    .font(.title)
             }
             .accessibilityLabel("Add list")
         }
         .foregroundStyle(BudgetSnapTheme.accent)
-        .padding(.horizontal, 34)
-        .padding(.top, 14)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 32)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
         .background(.clear)
+        .iPadReadableWidth()
     }
 }
 

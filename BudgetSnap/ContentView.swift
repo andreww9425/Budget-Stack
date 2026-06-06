@@ -54,21 +54,27 @@ struct ContentView: View {
                                     .padding(.horizontal, 24)
                                 } else {
                                     ForEach(sortedLists) { spendList in
-                                        NavigationLink {
-                                            TransactionListView(list: spendList, store: store)
-                                        } label: {
-                                            SpendListRow(
-                                                list: spendList,
-                                                isEditing: isEditingLists,
-                                                onDelete: { store.deleteList(spendList) }
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
-                                        .contextMenu {
-                                            Button(role: .destructive) {
-                                                store.deleteList(spendList)
+                                        SwipeActionRow(
+                                            isEnabled: !isEditingLists,
+                                            onDuplicate: nil,
+                                            onDelete: { store.deleteList(spendList) }
+                                        ) {
+                                            NavigationLink {
+                                                TransactionListView(list: spendList, store: store)
                                             } label: {
-                                                Label("Delete List", systemImage: "trash")
+                                                SpendListRow(
+                                                    list: spendList,
+                                                    isEditing: isEditingLists,
+                                                    onDelete: { store.deleteList(spendList) }
+                                                )
+                                            }
+                                            .buttonStyle(.plain)
+                                            .contextMenu {
+                                                Button(role: .destructive) {
+                                                    store.deleteList(spendList)
+                                                } label: {
+                                                    Label("Delete List", systemImage: "trash")
+                                                }
                                             }
                                         }
                                     }
@@ -76,6 +82,7 @@ struct ContentView: View {
                             }
                         }
                         .padding(.bottom, 18)
+                        .iPadReadableWidth()
                     }
 
                     ListsBottomBar(
@@ -162,14 +169,22 @@ struct TransactionListView: View {
     @ObservedObject var store: BudgetStore
     @Environment(\.dismiss) private var dismiss
     @State private var activeSheet: TransactionSheet?
-    @State private var transactionFilter: TransactionFilter = .unchecked
+    @State private var transactionFilter: TransactionFilter
     @State private var transactionSortMode: TransactionSortMode = .newest
     @State private var collapsedCategoryIDs: Set<BudgetCategory.ID> = []
     @State private var isSelecting = false
     @State private var isShowingQuickAdd = false
+    @State private var editingTransaction: Transaction?
     @State private var selectedTransactionIDs: Set<Transaction.ID> = []
+    @State private var transactionIDsPendingMove: Set<Transaction.ID> = []
     @State private var isShowingDeleteConfirmation = false
     @State private var isShowingMoveConfirmation = false
+
+    init(list: SpendList, store: BudgetStore) {
+        self.list = list
+        self.store = store
+        _transactionFilter = State(initialValue: TransactionFilter.lastUsed)
+    }
 
     private var displayedList: SpendList {
         store.displayedList(list)
@@ -212,18 +227,18 @@ struct TransactionListView: View {
                 )
 
                 ScrollView {
-                    VStack(spacing: 28) {
+                    VStack(spacing: 22) {
                         BudgetSnapTotalHeader(
                             title: transactionFilter.title,
                             total: visibleTotal,
                             onPrevious: {
                                 withAnimation(.snappy) {
-                                    transactionFilter = transactionFilter.previous
+                                    setTransactionFilter(transactionFilter.previous)
                                 }
                             },
                             onNext: {
                                 withAnimation(.snappy) {
-                                    transactionFilter = transactionFilter.next
+                                    setTransactionFilter(transactionFilter.next)
                                 }
                             }
                         )
@@ -241,7 +256,7 @@ struct TransactionListView: View {
                             }
                         )
 
-                        LazyVStack(spacing: 30) {
+                        LazyVStack(spacing: 22) {
                             if sections.isEmpty {
                                 ContentUnavailableView(
                                     "No Transactions",
@@ -266,6 +281,23 @@ struct TransactionListView: View {
                                                 store.toggleChecked(for: transactionID)
                                             }
                                         },
+                                        onDuplicateTransaction: { transactionID in
+                                            withAnimation(.snappy) {
+                                                store.duplicateTransaction(withID: transactionID)
+                                            }
+                                        },
+                                        onDeleteTransaction: { transactionID in
+                                            withAnimation(.snappy) {
+                                                store.deleteTransactions(withIDs: [transactionID])
+                                            }
+                                        },
+                                        onMoveTransaction: { transactionID in
+                                            transactionIDsPendingMove = [transactionID]
+                                            isShowingMoveConfirmation = true
+                                        },
+                                        onOpenTransaction: { transaction in
+                                            editingTransaction = transaction
+                                        },
                                         isSelecting: isSelecting,
                                         selectedTransactionIDs: selectedTransactionIDs,
                                         onSelectTransaction: { transactionID in
@@ -278,8 +310,9 @@ struct TransactionListView: View {
                             }
                         }
                     }
-                    .padding(.top, 22)
+                    .padding(.top, 18)
                     .padding(.bottom, 92)
+                    .iPadReadableWidth(820)
                 }
             }
 
@@ -307,7 +340,10 @@ struct TransactionListView: View {
             if isSelecting {
                 TransactionSelectionBottomBar(
                     selectedCount: selectedTransactionIDs.count,
-                    onMove: { isShowingMoveConfirmation = true },
+                    onMove: {
+                        transactionIDsPendingMove = selectedTransactionIDs
+                        isShowingMoveConfirmation = true
+                    },
                     onDelete: { isShowingDeleteConfirmation = true },
                     onDone: { toggleSelecting() }
                 )
@@ -350,6 +386,11 @@ struct TransactionListView: View {
                 }
             }
         }
+        .sheet(item: $editingTransaction) { transaction in
+            TransactionEditorView(transaction: transaction, categories: store.categories) { updatedTransaction in
+                store.updateTransaction(updatedTransaction)
+            }
+        }
         .confirmationDialog(
             "Move selected transactions",
             isPresented: $isShowingMoveConfirmation,
@@ -357,14 +398,15 @@ struct TransactionListView: View {
         ) {
             ForEach(store.categories) { category in
                 Button(category.name) {
-                    store.moveTransactions(withIDs: selectedTransactionIDs, to: category.id)
-                    finishSelecting()
+                    movePendingTransactions(to: category.id)
                 }
             }
 
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) {
+                transactionIDsPendingMove.removeAll()
+            }
         } message: {
-            Text("Choose a tag for \(selectedTransactionIDs.count) selected transactions.")
+            Text("Choose a tag for \(pendingMoveTransactionIDs.count) \(pendingMoveTransactionIDs.count == 1 ? "transaction" : "transactions").")
         }
         .confirmationDialog(
             "Delete selected transactions?",
@@ -412,6 +454,25 @@ struct TransactionListView: View {
         }
     }
 
+    private var pendingMoveTransactionIDs: Set<Transaction.ID> {
+        transactionIDsPendingMove.isEmpty ? selectedTransactionIDs : transactionIDsPendingMove
+    }
+
+    private func movePendingTransactions(to categoryID: BudgetCategory.ID) {
+        let ids = pendingMoveTransactionIDs
+        store.moveTransactions(withIDs: ids, to: categoryID)
+        transactionIDsPendingMove.removeAll()
+
+        if isSelecting {
+            finishSelecting()
+        }
+    }
+
+    private func setTransactionFilter(_ filter: TransactionFilter) {
+        transactionFilter = filter
+        TransactionFilter.saveLastUsed(filter)
+    }
+
     private func sortedTransactions(_ transactions: [Transaction]) -> [Transaction] {
         switch transactionSortMode {
         case .newest:
@@ -456,10 +517,25 @@ enum TransactionSortMode: CaseIterable {
     }
 }
 
-enum TransactionFilter: CaseIterable {
+enum TransactionFilter: String, CaseIterable {
     case unchecked
     case checked
     case all
+
+    private static let storageKey = "budgetstack.lastTransactionFilter"
+
+    static var lastUsed: TransactionFilter {
+        guard let rawValue = UserDefaults.standard.string(forKey: storageKey),
+              let filter = TransactionFilter(rawValue: rawValue) else {
+            return .unchecked
+        }
+
+        return filter
+    }
+
+    static func saveLastUsed(_ filter: TransactionFilter) {
+        UserDefaults.standard.set(filter.rawValue, forKey: storageKey)
+    }
 
     var title: String {
         switch self {
@@ -609,7 +685,7 @@ struct ListSharingView: View {
                 }
 
                 Section {
-                    Text("Collaborative iCloud syncing will use this entry point once the app has an iCloud data store.")
+                    Text("Budget data now syncs across your own devices with iCloud. Collaborative list sharing will use this entry point in a future update.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

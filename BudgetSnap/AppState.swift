@@ -1,5 +1,34 @@
 import Foundation
 import Combine
+import UIKit
+import StoreKit
+
+enum ICloudSyncState: Equatable {
+    case checking
+    case syncing
+    case available
+    case unavailable
+    case failed
+}
+
+struct ICloudSyncStatus: Equatable {
+    var state: ICloudSyncState = .checking
+    var summary = "Checking iCloud..."
+    var detail: String?
+    var lastCheckedAt: Date?
+    var lastFetchedAt: Date?
+    var lastPushedAt: Date?
+
+    var isBusy: Bool {
+        state == .checking || state == .syncing
+    }
+}
+
+struct BudgetRecoverySnapshot: Codable {
+    var savedAt: Date
+    var reason: String
+    var snapshot: BudgetCloudSnapshot
+}
 
 final class BudgetStore: ObservableObject {
     @Published var categories: [BudgetCategory] {
@@ -20,6 +49,7 @@ final class BudgetStore: ObservableObject {
     @Published var isPremiumUnlocked: Bool {
         didSet { saveSettings() }
     }
+    @Published private(set) var iCloudSyncStatus = ICloudSyncStatus()
 
     private let storageKey = "budgetsnap.transactions"
     private let categoriesStorageKey = "budgetsnap.categories"
@@ -27,6 +57,13 @@ final class BudgetStore: ObservableObject {
     private let appIconStorageKey = "budgetsnap.appIcon"
     private let appIconAppearanceStorageKey = "budgetsnap.appIconAppearance"
     private let premiumStorageKey = "budgetsnap.premiumUnlocked"
+    private let localModifiedStorageKey = "budgetstack.localModifiedAt"
+    private let localRecoverySnapshotsStorageKey = "budgetstack.localRecoverySnapshots"
+    private let maxLocalRecoverySnapshots = 8
+    private let iCloudSync = ICloudSyncStore()
+    private var isApplyingCloudSnapshot = false
+    private var foregroundObserver: NSObjectProtocol?
+    private var pendingCloudSave: DispatchWorkItem?
     private static let removedDefaultListIDs = Set([
         SpendList.appleCardID,
         SpendList.appleSavingsID,
@@ -84,6 +121,18 @@ final class BudgetStore: ObservableObject {
         selectedAppIcon = loadedIcon
         selectedAppIconAppearance = loadedIconAppearance
         isPremiumUnlocked = UserDefaults.standard.bool(forKey: premiumStorageKey)
+
+        configureICloudSync()
+        Task {
+            await refreshPremiumEntitlement()
+        }
+    }
+
+    deinit {
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
+        pendingCloudSave?.cancel()
     }
 
     var summaries: [SpendingSummary] {
@@ -145,8 +194,36 @@ final class BudgetStore: ObservableObject {
         add(updatedTransaction)
     }
 
+    func duplicateTransaction(withID id: Transaction.ID) {
+        guard let transaction = transactions.first(where: { $0.id == id }) else { return }
+
+        let duplicate = Transaction(
+            listID: transaction.listID,
+            title: transaction.title,
+            merchant: transaction.merchant,
+            amount: transaction.amount,
+            date: Date(),
+            categoryID: transaction.categoryID,
+            isChecked: transaction.isChecked,
+            recurrence: transaction.recurrence,
+            privateNote: transaction.privateNote
+        )
+
+        if let originalIndex = transactions.firstIndex(where: { $0.id == id }) {
+            transactions.insert(duplicate, at: originalIndex)
+        } else {
+            add(duplicate)
+        }
+    }
+
+    func updateTransaction(_ transaction: Transaction) {
+        guard let index = transactions.firstIndex(where: { $0.id == transaction.id }) else { return }
+        transactions[index] = transaction
+    }
+
     func deleteTransactions(withIDs ids: Set<Transaction.ID>) {
         guard !ids.isEmpty else { return }
+        saveLocalRecoverySnapshot(reason: "Before deleting transactions")
         transactions.removeAll { ids.contains($0.id) }
     }
 
@@ -164,17 +241,18 @@ final class BudgetStore: ObservableObject {
     }
 
     func deleteList(_ list: SpendList) {
+        saveLocalRecoverySnapshot(reason: "Before deleting list")
         spendLists.removeAll { $0.id == list.id }
         transactions.removeAll { $0.listID == list.id }
     }
 
-    func addTag(name: String, colorName: String) {
+    func addTag(name: String, icon: String, colorName: String) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
         categories.append(
             BudgetCategory(
                 name: trimmedName,
-                icon: "tag.fill",
+                icon: icon,
                 colorName: colorName,
                 monthlyLimit: 0
             )
@@ -194,6 +272,7 @@ final class BudgetStore: ObservableObject {
     func deleteTag(_ tag: BudgetCategory) {
         guard categories.count > 1 else { return }
         guard transactions.contains(where: { $0.categoryID == tag.id }) == false else { return }
+        saveLocalRecoverySnapshot(reason: "Before deleting tag")
         categories.removeAll { $0.id == tag.id }
     }
 
@@ -207,7 +286,26 @@ final class BudgetStore: ObservableObject {
     }
 
     func unlockPremium() {
-        isPremiumUnlocked = true
+        setPremiumUnlocked(true)
+    }
+
+    func setPremiumUnlocked(_ isUnlocked: Bool) {
+        isPremiumUnlocked = isUnlocked
+    }
+
+    @MainActor
+    func refreshPremiumEntitlement() async {
+        var hasPremium = false
+
+        for await entitlement in StoreKit.Transaction.currentEntitlements {
+            guard case .verified(let transaction) = entitlement else { continue }
+            if transaction.productID == PremiumPurchaseManager.productID {
+                hasPremium = true
+                break
+            }
+        }
+
+        setPremiumUnlocked(hasPremium)
     }
 
     func toggleChecked(for transactionID: Transaction.ID) {
@@ -219,24 +317,339 @@ final class BudgetStore: ObservableObject {
         categories.first { $0.id == id } ?? categories[0]
     }
 
+    var iCloudLastLocalChangeDate: Date? {
+        hasLocalModifiedDate ? localModifiedAt : nil
+    }
+
+    var localRecoverySnapshotCount: Int {
+        localRecoverySnapshots.count
+    }
+
+    var lastLocalRecoverySnapshotDate: Date? {
+        localRecoverySnapshots.first?.savedAt
+    }
+
+    func refreshICloudSync() {
+        checkICloudAndReconcile(isManual: true)
+    }
+
+    func pushCurrentDataToICloud() {
+        syncBudgetDataToICloud(isManual: true)
+    }
+
+    func restoreMostRecentLocalBackup() {
+        guard let recoverySnapshot = localRecoverySnapshots.first else {
+            iCloudSyncStatus.state = .failed
+            iCloudSyncStatus.summary = "No backup found"
+            iCloudSyncStatus.detail = "Budget Stack has not made a local recovery snapshot yet."
+            return
+        }
+
+        saveLocalRecoverySnapshot(reason: "Before restoring local backup")
+        pendingCloudSave?.cancel()
+        isApplyingCloudSnapshot = true
+        categories = recoverySnapshot.snapshot.categories.isEmpty ? BudgetCategory.sample : recoverySnapshot.snapshot.categories
+        spendLists = recoverySnapshot.snapshot.spendLists.filter { Self.removedDefaultListIDs.contains($0.id) == false }
+        transactions = validTransactions(from: recoverySnapshot.snapshot.transactions, categories: categories, spendLists: spendLists)
+        isApplyingCloudSnapshot = false
+        localModifiedAt = Date()
+
+        iCloudSyncStatus.summary = "Restored local backup"
+        iCloudSyncStatus.detail = "Budget Stack restored your most recent recovery snapshot and is pushing it to iCloud."
+        syncBudgetDataToICloud(isManual: true)
+    }
+
     private func save() {
         guard let data = try? JSONEncoder().encode(transactions) else { return }
         UserDefaults.standard.set(data, forKey: storageKey)
+        syncBudgetDataToICloud()
     }
 
     private func saveLists() {
         guard let data = try? JSONEncoder().encode(spendLists) else { return }
         UserDefaults.standard.set(data, forKey: listsStorageKey)
+        syncBudgetDataToICloud()
     }
 
     private func saveCategories() {
         guard let data = try? JSONEncoder().encode(categories) else { return }
         UserDefaults.standard.set(data, forKey: categoriesStorageKey)
+        syncBudgetDataToICloud()
     }
 
     private func saveSettings() {
         UserDefaults.standard.set(selectedAppIcon.rawValue, forKey: appIconStorageKey)
         UserDefaults.standard.set(selectedAppIconAppearance.rawValue, forKey: appIconAppearanceStorageKey)
         UserDefaults.standard.set(isPremiumUnlocked, forKey: premiumStorageKey)
+    }
+
+    private func configureICloudSync() {
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.checkICloudAndReconcile()
+        }
+
+        checkICloudAndReconcile()
+    }
+
+    private func checkICloudAndReconcile(isManual: Bool = false) {
+        iCloudSyncStatus.state = .checking
+        iCloudSyncStatus.summary = "Checking iCloud..."
+        iCloudSyncStatus.detail = nil
+        iCloudSyncStatus.lastCheckedAt = Date()
+
+        iCloudSync.accountState { [weak self] accountState in
+            guard let self else { return }
+
+            switch accountState {
+            case .available:
+                self.reconcileWithICloud(isManual: isManual)
+            case .unavailable(let message):
+                self.iCloudSyncStatus.state = .unavailable
+                self.iCloudSyncStatus.summary = "iCloud unavailable"
+                self.iCloudSyncStatus.detail = message
+            }
+        }
+    }
+
+    private func reconcileWithICloud(isManual: Bool = false) {
+        iCloudSyncStatus.state = .syncing
+        iCloudSyncStatus.summary = isManual ? "Refreshing from iCloud..." : "Syncing with iCloud..."
+        iCloudSyncStatus.detail = nil
+
+        iCloudSync.loadSnapshot { [weak self] result in
+            guard let self else { return }
+
+            switch result {
+            case .success(let cloudSnapshot):
+                self.handleLoadedCloudSnapshot(cloudSnapshot, isManual: isManual)
+            case .failure(let error):
+                self.iCloudSyncStatus.state = .failed
+                self.iCloudSyncStatus.summary = "Sync check failed"
+                self.iCloudSyncStatus.detail = error.localizedDescription
+            }
+        }
+    }
+
+    private func handleLoadedCloudSnapshot(_ cloudSnapshot: BudgetCloudSnapshot?, isManual: Bool) {
+        guard let cloudSnapshot else {
+            if hasLocalBudgetData {
+                iCloudSyncStatus.summary = "No iCloud copy found"
+                iCloudSyncStatus.detail = "Uploading this device's current data."
+                syncBudgetDataToICloud(isManual: isManual)
+            } else {
+                iCloudSyncStatus.state = .available
+                iCloudSyncStatus.summary = "iCloud ready"
+                iCloudSyncStatus.detail = "No budget data has been synced yet."
+            }
+            return
+        }
+
+        iCloudSyncStatus.lastFetchedAt = Date()
+
+        if shouldKeepLocalDataInsteadOfEmptyCloud(cloudSnapshot) {
+            iCloudSyncStatus.state = .failed
+            iCloudSyncStatus.summary = "Empty iCloud data blocked"
+            iCloudSyncStatus.detail = "This device has budget data, but iCloud returned an empty copy. Budget Stack kept your local data and did not overwrite it."
+            return
+        }
+
+        if shouldMergeFirstSync(with: cloudSnapshot) {
+            let mergedSnapshot = mergedSnapshot(with: cloudSnapshot)
+            applyCloudSnapshot(mergedSnapshot)
+            iCloudSyncStatus.summary = "Merged iCloud data"
+            iCloudSyncStatus.detail = "This device and iCloud both had data, so Budget Stack merged them."
+            syncBudgetDataToICloud(isManual: isManual)
+        } else if cloudSnapshot.updatedAt > localModifiedAt {
+            applyCloudSnapshot(cloudSnapshot)
+            iCloudSyncStatus.state = .available
+            iCloudSyncStatus.summary = "Updated from iCloud"
+            iCloudSyncStatus.detail = "Fetched the latest budget data from iCloud."
+        } else if hasLocalBudgetData {
+            if isManual {
+                iCloudSyncStatus.state = .available
+                iCloudSyncStatus.summary = "Already up to date"
+                iCloudSyncStatus.detail = "This device has the latest budget data."
+            } else {
+                syncBudgetDataToICloud()
+            }
+        } else {
+            iCloudSyncStatus.state = .available
+            iCloudSyncStatus.summary = "iCloud ready"
+            iCloudSyncStatus.detail = "No budget data has been synced yet."
+        }
+    }
+
+    private func syncBudgetDataToICloud(isManual: Bool = false) {
+        guard !isApplyingCloudSnapshot else { return }
+
+        if isManual && !hasLocalBudgetData {
+            iCloudSyncStatus.state = .available
+            iCloudSyncStatus.summary = "Nothing to upload"
+            iCloudSyncStatus.detail = "Create a list or transaction before pushing data to iCloud."
+            return
+        }
+
+        let now = Date()
+        localModifiedAt = now
+
+        let snapshot = BudgetCloudSnapshot(
+            updatedAt: now,
+            categories: categories,
+            transactions: transactions,
+            spendLists: spendLists
+        )
+
+        iCloudSyncStatus.state = .syncing
+        iCloudSyncStatus.summary = isManual ? "Pushing current data..." : "Syncing changes..."
+        iCloudSyncStatus.detail = nil
+
+        pendingCloudSave?.cancel()
+        let saveWork = DispatchWorkItem { [weak self, iCloudSync] in
+            iCloudSync.save(snapshot) { result in
+                guard let self else { return }
+
+                switch result {
+                case .success:
+                    self.iCloudSyncStatus.state = .available
+                    self.iCloudSyncStatus.summary = "iCloud sync active"
+                    self.iCloudSyncStatus.detail = "Your lists, tags, and transactions are synced through your iCloud account."
+                    self.iCloudSyncStatus.lastPushedAt = Date()
+                case .failure(let error):
+                    self.iCloudSyncStatus.state = .failed
+                    self.iCloudSyncStatus.summary = "Sync upload failed"
+                    self.iCloudSyncStatus.detail = error.localizedDescription
+                }
+            }
+        }
+        pendingCloudSave = saveWork
+
+        if isManual {
+            DispatchQueue.main.async(execute: saveWork)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: saveWork)
+        }
+    }
+
+    private func applyCloudSnapshot(_ snapshot: BudgetCloudSnapshot) {
+        saveLocalRecoverySnapshot(reason: "Before applying iCloud data")
+        pendingCloudSave?.cancel()
+        isApplyingCloudSnapshot = true
+        categories = snapshot.categories.isEmpty ? BudgetCategory.sample : snapshot.categories
+        spendLists = snapshot.spendLists.filter { Self.removedDefaultListIDs.contains($0.id) == false }
+        transactions = validTransactions(from: snapshot.transactions, categories: categories, spendLists: spendLists)
+        isApplyingCloudSnapshot = false
+        localModifiedAt = snapshot.updatedAt
+    }
+
+    private var hasLocalBudgetData: Bool {
+        !spendLists.isEmpty || !transactions.isEmpty || categories != BudgetCategory.sample
+    }
+
+    private func shouldKeepLocalDataInsteadOfEmptyCloud(_ cloudSnapshot: BudgetCloudSnapshot) -> Bool {
+        hasLocalBudgetData && !cloudSnapshot.hasUserData
+    }
+
+    private var localModifiedAt: Date {
+        get {
+            UserDefaults.standard.object(forKey: localModifiedStorageKey) as? Date ?? .distantPast
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: localModifiedStorageKey)
+        }
+    }
+
+    private var hasLocalModifiedDate: Bool {
+        UserDefaults.standard.object(forKey: localModifiedStorageKey) != nil
+    }
+
+    private func shouldMergeFirstSync(with cloudSnapshot: BudgetCloudSnapshot) -> Bool {
+        hasLocalBudgetData && !hasLocalModifiedDate && !cloudSnapshot.spendLists.isEmpty
+    }
+
+    private func mergedSnapshot(with cloudSnapshot: BudgetCloudSnapshot) -> BudgetCloudSnapshot {
+        var mergedCategories: [BudgetCategory.ID: BudgetCategory] = [:]
+        cloudSnapshot.categories.forEach { mergedCategories[$0.id] = $0 }
+        categories.forEach { mergedCategories[$0.id] = $0 }
+
+        var mergedLists: [SpendList.ID: SpendList] = [:]
+        cloudSnapshot.spendLists.forEach { mergedLists[$0.id] = $0 }
+        spendLists.forEach { mergedLists[$0.id] = $0 }
+
+        var mergedTransactions: [Transaction.ID: Transaction] = [:]
+        cloudSnapshot.transactions.forEach { mergedTransactions[$0.id] = $0 }
+        transactions.forEach { mergedTransactions[$0.id] = $0 }
+
+        let categories = Array(mergedCategories.values)
+        let spendLists = Array(mergedLists.values)
+
+        return BudgetCloudSnapshot(
+            updatedAt: Date(),
+            categories: categories,
+            transactions: validTransactions(
+                from: Array(mergedTransactions.values),
+                categories: categories,
+                spendLists: spendLists
+            ),
+            spendLists: spendLists
+        )
+    }
+
+    private func validTransactions(
+        from transactions: [Transaction],
+        categories: [BudgetCategory],
+        spendLists: [SpendList]
+    ) -> [Transaction] {
+        let categoryIDs = Set(categories.map(\.id))
+        let listIDs = Set(spendLists.map(\.id))
+
+        return transactions.filter { transaction in
+            categoryIDs.contains(transaction.categoryID)
+                && listIDs.contains(transaction.listID)
+                && Self.removedDefaultListIDs.contains(transaction.listID) == false
+        }
+    }
+
+    private func currentBudgetSnapshot() -> BudgetCloudSnapshot {
+        BudgetCloudSnapshot(
+            updatedAt: localModifiedAt,
+            categories: categories,
+            transactions: transactions,
+            spendLists: spendLists
+        )
+    }
+
+    private func saveLocalRecoverySnapshot(reason: String) {
+        let snapshot = currentBudgetSnapshot()
+        guard snapshot.hasUserData else { return }
+
+        var snapshots = localRecoverySnapshots
+        snapshots.insert(
+            BudgetRecoverySnapshot(
+                savedAt: Date(),
+                reason: reason,
+                snapshot: snapshot
+            ),
+            at: 0
+        )
+
+        if snapshots.count > maxLocalRecoverySnapshots {
+            snapshots = Array(snapshots.prefix(maxLocalRecoverySnapshots))
+        }
+
+        guard let data = try? JSONEncoder().encode(snapshots) else { return }
+        UserDefaults.standard.set(data, forKey: localRecoverySnapshotsStorageKey)
+    }
+
+    private var localRecoverySnapshots: [BudgetRecoverySnapshot] {
+        guard let data = UserDefaults.standard.data(forKey: localRecoverySnapshotsStorageKey),
+              let snapshots = try? JSONDecoder().decode([BudgetRecoverySnapshot].self, from: data) else {
+            return []
+        }
+
+        return snapshots
     }
 }

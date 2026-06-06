@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct AddTransactionView: View {
     let categories: [BudgetCategory]
@@ -87,7 +88,7 @@ struct QuickAddTransactionPopup: View {
     let onSave: (Transaction) -> Void
 
     @State private var itemName = ""
-    @State private var cost = ""
+    @State private var costDigits = ""
     @State private var selectedCategoryID: BudgetCategory.ID?
     @State private var isShowingTagBar = false
     @FocusState private var focusedField: Field?
@@ -98,7 +99,7 @@ struct QuickAddTransactionPopup: View {
     }
 
     private var parsedCost: Decimal? {
-        Decimal(string: cost.filter { "0123456789.".contains($0) })
+        MoneyEntry.amount(from: costDigits)
     }
 
     private var canSave: Bool {
@@ -119,7 +120,7 @@ struct QuickAddTransactionPopup: View {
             Color.black.opacity(0.38)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    onCancel()
+                    cancel()
                 }
 
             VStack(spacing: 0) {
@@ -139,9 +140,9 @@ struct QuickAddTransactionPopup: View {
 
                     Divider()
 
-                    TextField("$0.00", text: $cost)
+                    TextField("$0.00", text: costBinding)
                         .font(.title2.weight(.semibold))
-                        .keyboardType(.decimalPad)
+                        .keyboardType(.numberPad)
                         .focused($focusedField, equals: .cost)
                         .padding(.horizontal, 24)
                         .frame(height: 76)
@@ -152,6 +153,7 @@ struct QuickAddTransactionPopup: View {
                         .strokeBorder(.white.opacity(0.12), lineWidth: 1)
                 }
                 .padding(.horizontal, 20)
+                .iPadReadableWidth(620)
 
                 Spacer()
             }
@@ -170,9 +172,10 @@ struct QuickAddTransactionPopup: View {
                         }
                     )
                     .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .iPadReadableWidth(820)
                 }
 
-                HStack(spacing: 10) {
+                HStack(spacing: 12) {
                     Button {
                         withAnimation(.snappy) {
                             isShowingTagBar.toggle()
@@ -205,26 +208,37 @@ struct QuickAddTransactionPopup: View {
                         save()
                     } label: {
                         Text("Add")
-                            .font(.title3.weight(.semibold))
+                            .font(.headline.weight(.semibold))
                             .lineLimit(1)
                             .minimumScaleFactor(0.85)
-                            .frame(width: 70, height: 44)
+                            .frame(minWidth: 76, minHeight: 42)
+                            .padding(.horizontal, 4)
                     }
                     .buttonStyle(.borderedProminent)
-                    .controlSize(.regular)
-                    .fixedSize()
+                    .buttonBorderShape(.capsule)
                     .disabled(!canSave)
                 }
-                .frame(height: 64)
+                .frame(minHeight: 64)
                 .padding(.horizontal, 16)
-                .background(Color(uiColor: .systemBackground))
-                .overlay(alignment: .top) {
+                .padding(.vertical, 8)
+                .background {
                     Rectangle()
-                        .fill(Color(uiColor: .separator).opacity(0.35))
-                        .frame(height: 1)
+                        .fill(Color(uiColor: .systemBackground))
                 }
+                .overlay(alignment: .top) {
+                    VStack(spacing: 0) {
+                        Rectangle()
+                            .fill(Color(uiColor: .separator).opacity(0.45))
+                            .frame(height: 1)
+
+                        Rectangle()
+                            .fill(.black.opacity(0.06))
+                            .frame(height: 1)
+                    }
+                }
+                .shadow(color: .black.opacity(0.12), radius: 10, y: -3)
+                .iPadReadableWidth(820)
             }
-            .ignoresSafeArea(.keyboard, edges: .bottom)
         }
         .onAppear {
             focusedField = .itemName
@@ -232,10 +246,27 @@ struct QuickAddTransactionPopup: View {
         }
     }
 
+    private var costBinding: Binding<String> {
+        Binding(
+            get: {
+                MoneyEntry.displayText(from: costDigits)
+            },
+            set: { newValue in
+                costDigits = MoneyEntry.digits(from: newValue)
+            }
+        )
+    }
+
+    private func cancel() {
+        dismissKeyboard()
+        onCancel()
+    }
+
     private func save() {
         guard let parsedCost, let categoryID = selectedCategoryID ?? fallbackCategory?.id else { return }
         let trimmedName = itemName.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        dismissKeyboard()
         onSave(
             Transaction(
                 title: trimmedName,
@@ -245,6 +276,11 @@ struct QuickAddTransactionPopup: View {
                 categoryID: categoryID
             )
         )
+    }
+
+    private func dismissKeyboard() {
+        focusedField = nil
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 }
 
@@ -269,15 +305,18 @@ struct QuickAddTagPickerBar: View {
             .padding(.vertical, 10)
         }
         .frame(height: 58)
-        .background(Color(uiColor: .systemBackground))
+        .background {
+            Rectangle()
+                .fill(Color(uiColor: .systemBackground))
+        }
         .overlay(alignment: .top) {
             Rectangle()
-                .fill(Color(uiColor: .separator).opacity(0.25))
+                .fill(Color(uiColor: .separator).opacity(0.45))
                 .frame(height: 1)
         }
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(Color(uiColor: .separator).opacity(0.35))
+                .fill(Color(uiColor: .separator).opacity(0.45))
                 .frame(height: 1)
         }
     }
@@ -317,5 +356,152 @@ struct QuickAddTagChip: View {
             .contentShape(Capsule(style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+}
+
+enum MoneyEntry {
+    private static let maximumDigits = 12
+
+    static func digits(from text: String) -> String {
+        String(text.filter(\.isNumber).prefix(maximumDigits))
+    }
+
+    static func amount(from digits: String) -> Decimal? {
+        guard digits.isEmpty == false, let wholeCents = Decimal(string: digits) else { return nil }
+        return wholeCents / 100
+    }
+
+    static func displayText(from digits: String) -> String {
+        guard let amount = amount(from: digits) else { return "" }
+
+        return amount.formatted(
+            .currency(code: Locale.current.currency?.identifier ?? "USD")
+                .precision(.fractionLength(2))
+        )
+    }
+}
+
+struct TransactionEditorView: View {
+    let transaction: Transaction
+    let categories: [BudgetCategory]
+    let onSave: (Transaction) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String
+    @State private var amount: String
+    @State private var date: Date
+    @State private var categoryID: BudgetCategory.ID
+    @State private var recurrence: TransactionRecurrence
+    @State private var privateNote: String
+
+    init(
+        transaction: Transaction,
+        categories: [BudgetCategory],
+        onSave: @escaping (Transaction) -> Void
+    ) {
+        self.transaction = transaction
+        self.categories = categories
+        self.onSave = onSave
+        _title = State(initialValue: transaction.title)
+        _amount = State(initialValue: transaction.amount.editorString)
+        _date = State(initialValue: transaction.date)
+        _categoryID = State(initialValue: transaction.categoryID)
+        _recurrence = State(initialValue: transaction.recurrence)
+        _privateNote = State(initialValue: transaction.privateNote)
+    }
+
+    private var parsedAmount: Decimal? {
+        Decimal(string: amount.filter { "0123456789.".contains($0) })
+    }
+
+    private var canSave: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && parsedAmount != nil
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Transaction") {
+                    TextField("Item Name", text: $title)
+                        .textInputAutocapitalization(.words)
+
+                    TextField("$0.00", text: $amount)
+                        .keyboardType(.decimalPad)
+
+                    DatePicker("Date", selection: $date, displayedComponents: .date)
+                }
+
+                Section("Tag") {
+                    Picker("Tag", selection: $categoryID) {
+                        ForEach(categories) { category in
+                            Label(category.name, systemImage: category.icon)
+                                .tag(category.id)
+                        }
+                    }
+                }
+
+                Section("Repeat") {
+                    Picker("Schedule", selection: $recurrence) {
+                        ForEach(TransactionRecurrence.allCases) { option in
+                            Text(option.title)
+                                .tag(option)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+
+                Section("Private Note") {
+                    TextEditor(text: $privateNote)
+                        .frame(minHeight: 110)
+                        .overlay(alignment: .topLeading) {
+                            if privateNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text("Add a note...")
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 8)
+                                    .padding(.leading, 5)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                }
+            }
+            .navigationTitle("Transaction")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        save()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+
+    private func save() {
+        guard let parsedAmount else { return }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var updatedTransaction = transaction
+        updatedTransaction.title = trimmedTitle
+        updatedTransaction.merchant = trimmedTitle
+        updatedTransaction.amount = parsedAmount
+        updatedTransaction.date = date
+        updatedTransaction.categoryID = categoryID
+        updatedTransaction.recurrence = recurrence
+        updatedTransaction.privateNote = privateNote.trimmingCharacters(in: .whitespacesAndNewlines)
+        onSave(updatedTransaction)
+        dismiss()
+    }
+}
+
+private extension Decimal {
+    var editorString: String {
+        NSDecimalNumber(decimal: self).stringValue
     }
 }

@@ -10,13 +10,87 @@ struct BudgetCategory: Identifiable, Codable, Hashable {
 
     var tint: Color {
         switch colorName {
-        case "mint": .mint
+        case "red": .red
         case "orange": .orange
         case "yellow": .yellow
-        case "indigo": .indigo
-        case "pink": .pink
+        case "green": .green
+        case "mint": .mint
         case "teal": .teal
+        case "cyan": .cyan
+        case "blue": .blue
+        case "indigo": .indigo
+        case "purple": .purple
+        case "pink": .pink
+        case "brown": .brown
+        case "gray": .gray
         default: .blue
+        }
+    }
+
+    static let tagColorNames = [
+        "red",
+        "orange",
+        "yellow",
+        "green",
+        "mint",
+        "teal",
+        "cyan",
+        "blue",
+        "indigo",
+        "purple",
+        "pink",
+        "brown",
+        "gray"
+    ]
+
+    static let tagIconNames = [
+        "house.fill",
+        "sparkles",
+        "fork.knife",
+        "cart.fill",
+        "bolt.fill",
+        "tshirt.fill",
+        "fuelpump.fill",
+        "car.fill",
+        "cross.case.fill",
+        "heart.fill",
+        "stethoscope",
+        "pills.fill",
+        "bag.fill",
+        "creditcard.fill",
+        "banknote.fill",
+        "dollarsign.circle.fill",
+        "gift.fill",
+        "gamecontroller.fill",
+        "popcorn.fill",
+        "figure.run",
+        "dumbbell.fill",
+        "airplane",
+        "tram.fill",
+        "bus.fill",
+        "graduationcap.fill",
+        "book.fill",
+        "pawprint.fill",
+        "leaf.fill",
+        "wrench.and.screwdriver.fill",
+        "hammer.fill",
+        "wifi",
+        "phone.fill",
+        "desktopcomputer",
+        "cart.badge.plus",
+        "shippingbox.fill",
+        "tag.fill"
+    ]
+
+    static func tint(for colorName: String) -> Color {
+        BudgetCategory(name: "", icon: "", colorName: colorName, monthlyLimit: 0).tint
+    }
+
+    static func displayName(for colorName: String) -> String {
+        switch colorName {
+        case "cyan": "Cyan"
+        case "gray": "Gray"
+        default: colorName.capitalized
         }
     }
 }
@@ -30,6 +104,8 @@ struct Transaction: Identifiable, Codable, Hashable {
     var date: Date
     var categoryID: BudgetCategory.ID
     var isChecked = false
+    var recurrence: TransactionRecurrence = .oneTime
+    var privateNote = ""
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -40,6 +116,8 @@ struct Transaction: Identifiable, Codable, Hashable {
         case date
         case categoryID
         case isChecked
+        case recurrence
+        case privateNote
     }
 
     init(
@@ -50,7 +128,9 @@ struct Transaction: Identifiable, Codable, Hashable {
         amount: Decimal,
         date: Date,
         categoryID: BudgetCategory.ID,
-        isChecked: Bool = false
+        isChecked: Bool = false,
+        recurrence: TransactionRecurrence = .oneTime,
+        privateNote: String = ""
     ) {
         self.id = id
         self.listID = listID
@@ -60,6 +140,8 @@ struct Transaction: Identifiable, Codable, Hashable {
         self.date = date
         self.categoryID = categoryID
         self.isChecked = isChecked
+        self.recurrence = recurrence
+        self.privateNote = privateNote
     }
 
     init(from decoder: Decoder) throws {
@@ -72,6 +154,32 @@ struct Transaction: Identifiable, Codable, Hashable {
         date = try container.decode(Date.self, forKey: .date)
         categoryID = try container.decode(BudgetCategory.ID.self, forKey: .categoryID)
         isChecked = try container.decodeIfPresent(Bool.self, forKey: .isChecked) ?? false
+        recurrence = try container.decodeIfPresent(TransactionRecurrence.self, forKey: .recurrence) ?? .oneTime
+        privateNote = try container.decodeIfPresent(String.self, forKey: .privateNote) ?? ""
+    }
+}
+
+enum TransactionRecurrence: String, Codable, CaseIterable, Identifiable, Hashable {
+    case oneTime
+    case daily
+    case weekly
+    case monthly
+    case yearly
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .oneTime: "One-Time"
+        case .daily: "Daily"
+        case .weekly: "Weekly"
+        case .monthly: "Monthly"
+        case .yearly: "Yearly"
+        }
+    }
+
+    var isRecurring: Bool {
+        self != .oneTime
     }
 }
 

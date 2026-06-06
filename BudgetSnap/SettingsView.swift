@@ -1,5 +1,128 @@
 import SwiftUI
 import UIKit
+import StoreKit
+
+@MainActor
+final class PremiumPurchaseManager: ObservableObject {
+    static let productID = "com.BudgetSnap.premium"
+
+    @Published private(set) var product: Product?
+    @Published private(set) var isLoading = false
+    @Published var message: String?
+
+    private var productLoadTask: Task<Void, Never>?
+
+    var purchaseTitle: String {
+        if isLoading {
+            return "Loading..."
+        }
+
+        if let product {
+            return "Unlock Premium \(product.displayPrice)"
+        }
+
+        return "Unlock Premium"
+    }
+
+    func prepare(store: BudgetStore) async {
+        await loadProduct()
+        await refreshEntitlements(store: store)
+    }
+
+    func purchase(store: BudgetStore) async {
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            let product = try await premiumProduct()
+            let result = try await product.purchase()
+
+            switch result {
+            case .success(let verification):
+                let transaction = try checkVerified(verification)
+                store.setPremiumUnlocked(true)
+                message = "Premium unlocked."
+                await transaction.finish()
+            case .userCancelled:
+                message = nil
+            case .pending:
+                message = "Purchase pending approval."
+            @unknown default:
+                message = "Purchase could not be completed."
+            }
+        } catch {
+            message = "Premium is not available yet. Check the in-app purchase product in App Store Connect."
+        }
+    }
+
+    func restore(store: BudgetStore) async {
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            try await AppStore.sync()
+            await refreshEntitlements(store: store)
+            message = store.isPremiumUnlocked ? "Premium restored." : "No Premium purchase was found."
+        } catch {
+            message = "Restore failed. Please try again."
+        }
+    }
+
+    private func loadProduct() async {
+        guard product == nil else { return }
+
+        do {
+            product = try await Product.products(for: [Self.productID]).first
+            if product == nil {
+                message = "Premium product not found."
+            }
+        } catch {
+            message = "Premium product could not load."
+        }
+    }
+
+    private func refreshEntitlements(store: BudgetStore) async {
+        var hasPremium = false
+
+        for await entitlement in StoreKit.Transaction.currentEntitlements {
+            guard let transaction = try? checkVerified(entitlement) else { continue }
+            if transaction.productID == Self.productID {
+                hasPremium = true
+                break
+            }
+        }
+
+        store.setPremiumUnlocked(hasPremium)
+    }
+
+    private func premiumProduct() async throws -> Product {
+        if let product {
+            return product
+        }
+
+        let products = try await Product.products(for: [Self.productID])
+        guard let product = products.first else {
+            throw PremiumPurchaseError.productNotFound
+        }
+
+        self.product = product
+        return product
+    }
+
+    private func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
+        switch result {
+        case .verified(let value):
+            return value
+        case .unverified:
+            throw PremiumPurchaseError.unverified
+        }
+    }
+}
+
+enum PremiumPurchaseError: Error {
+    case productNotFound
+    case unverified
+}
 
 struct SettingsView: View {
     @ObservedObject var store: BudgetStore
@@ -42,6 +165,10 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(store.isPremiumUnlocked)
+                }
+
+                Section("iCloud Sync") {
+                    ICloudSyncDashboardView(store: store)
                 }
 
                 Section("Lists") {
@@ -120,6 +247,9 @@ struct SettingsView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+
+                AppBuildFooterView()
+                    .listRowBackground(Color.clear)
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -160,6 +290,159 @@ struct SettingsView: View {
 
     private func applyUnlockedIcon(_ choice: AppIconChoice) {
         store.selectAppIcon(choice)
+    }
+}
+
+struct AppBuildFooterView: View {
+    private var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+    }
+
+    private var build: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
+    }
+
+    var body: some View {
+        Text("Budget Stack \(version) (\(build))")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .multilineTextAlignment(.center)
+            .padding(.vertical, 8)
+            .accessibilityLabel("Budget Stack version \(version), build \(build)")
+    }
+}
+
+struct ICloudSyncDashboardView: View {
+    @ObservedObject var store: BudgetStore
+    @State private var isConfirmingRestore = false
+
+    private var status: ICloudSyncStatus {
+        store.iCloudSyncStatus
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: statusIcon)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .frame(width: 28, height: 28)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(status.summary)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+
+                    if let detail = status.detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                if status.isBusy {
+                    ProgressView()
+                }
+            }
+
+            VStack(spacing: 8) {
+                SyncDateRow(title: "Last checked", date: status.lastCheckedAt)
+                SyncDateRow(title: "Last fetched", date: status.lastFetchedAt)
+                SyncDateRow(title: "Last pushed", date: status.lastPushedAt)
+                SyncDateRow(title: "Local change", date: store.iCloudLastLocalChangeDate)
+                SyncDateRow(title: "Last backup", date: store.lastLocalRecoverySnapshotDate)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    store.refreshICloudSync()
+                } label: {
+                    Label("Fetch Latest", systemImage: "icloud.and.arrow.down")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(status.isBusy)
+
+                Button {
+                    store.pushCurrentDataToICloud()
+                } label: {
+                    Label("Push Current", systemImage: "icloud.and.arrow.up")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(status.isBusy)
+            }
+
+            Button(role: .destructive) {
+                isConfirmingRestore = true
+            } label: {
+                Label("Restore Last Local Backup", systemImage: "clock.arrow.circlepath")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.localRecoverySnapshotCount == 0 || status.isBusy)
+        }
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .contain)
+        .confirmationDialog(
+            "Restore the most recent local backup?",
+            isPresented: $isConfirmingRestore,
+            titleVisibility: .visible
+        ) {
+            Button("Restore Backup", role: .destructive) {
+                store.restoreMostRecentLocalBackup()
+            }
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This replaces the current lists, tags, and transactions on this device, then pushes that restored copy to iCloud.")
+        }
+    }
+
+    private var statusIcon: String {
+        switch status.state {
+        case .checking: "icloud"
+        case .syncing: "arrow.triangle.2.circlepath"
+        case .available: "icloud.fill"
+        case .unavailable: "icloud.slash"
+        case .failed: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var statusColor: Color {
+        switch status.state {
+        case .checking, .syncing: BudgetSnapTheme.accent
+        case .available: .green
+        case .unavailable: .secondary
+        case .failed: .red
+        }
+    }
+}
+
+struct SyncDateRow: View {
+    let title: String
+    let date: Date?
+
+    var body: some View {
+        HStack {
+            Text(title)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Text(formattedDate)
+                .foregroundStyle(.primary)
+                .monospacedDigit()
+        }
+        .font(.caption)
+    }
+
+    private var formattedDate: String {
+        guard let date else { return "Never" }
+        return date.formatted(date: .abbreviated, time: .shortened)
     }
 }
 
@@ -279,9 +562,9 @@ struct PrivacyPolicyView: View {
             Section("Privacy Policy") {
                 Text("Budget Stack does not collect, sell, or share personal data.")
 
-                Text("Your lists, transactions, tags, settings, and app preferences are stored on your device. Budget Stack does not send this information to Andrew Williams, Codex, OpenAI, or any third-party analytics service.")
+                Text("Your lists, transactions, and tags are stored on your device and may sync through your personal iCloud account. Budget Stack does not send this information to Andrew Williams, Codex, OpenAI, or any third-party analytics service.")
 
-                Text("If you choose to use future iCloud sharing features, Apple may process the information needed to sync or share your data through iCloud according to your Apple account and iCloud settings.")
+                Text("If you use iCloud sync or future iCloud sharing features, Apple may process the information needed to sync or share your data through iCloud according to your Apple account and iCloud settings.")
             }
 
             Section("Data Collected") {
@@ -302,6 +585,7 @@ struct PrivacyPolicyView: View {
 struct PremiumPaywallView: View {
     @ObservedObject var store: BudgetStore
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var purchaseManager = PremiumPurchaseManager()
     var dismissAfterUnlock = true
     var onUnlock: () -> Void = {}
 
@@ -340,20 +624,34 @@ struct PremiumPaywallView: View {
 
                 VStack(spacing: 12) {
                     Button {
-                        unlock()
+                        Task {
+                            await purchaseManager.purchase(store: store)
+                            completeUnlockIfNeeded()
+                        }
                     } label: {
-                        Text(store.isPremiumUnlocked ? "Premium Unlocked" : "Unlock Premium")
+                        Text(store.isPremiumUnlocked ? "Premium Unlocked" : purchaseManager.purchaseTitle)
                             .font(.headline)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 15)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(store.isPremiumUnlocked)
+                    .disabled(store.isPremiumUnlocked || purchaseManager.isLoading)
 
                     Button("Restore Purchase") {
-                        unlock()
+                        Task {
+                            await purchaseManager.restore(store: store)
+                            completeUnlockIfNeeded()
+                        }
                     }
                     .font(.subheadline.weight(.semibold))
+                    .disabled(purchaseManager.isLoading)
+
+                    if let message = purchaseManager.message, !store.isPremiumUnlocked {
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
                 }
                 .padding(.horizontal, 24)
             }
@@ -368,11 +666,14 @@ struct PremiumPaywallView: View {
                     }
                 }
             }
+            .task {
+                await purchaseManager.prepare(store: store)
+            }
         }
     }
 
-    private func unlock() {
-        store.unlockPremium()
+    private func completeUnlockIfNeeded() {
+        guard store.isPremiumUnlocked else { return }
         onUnlock()
 
         if dismissAfterUnlock {
@@ -414,8 +715,11 @@ struct TagManagerView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var newTagName = ""
     @State private var selectedColor = "mint"
+    @State private var selectedIcon = "tag.fill"
 
-    private let colors = ["mint", "yellow", "pink", "teal", "indigo", "blue"]
+    private let columns = [
+        GridItem(.adaptive(minimum: 42), spacing: 12)
+    ]
 
     var body: some View {
         NavigationStack {
@@ -423,15 +727,35 @@ struct TagManagerView: View {
                 Section("New Tag") {
                     TextField("Tag name", text: $newTagName)
 
-                    Picker("Color", selection: $selectedColor) {
-                        ForEach(colors, id: \.self) { color in
-                            Text(color.capitalized)
-                                .tag(color)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 12) {
+                            ForEach(BudgetCategory.tagIconNames, id: \.self) { iconName in
+                                TagIconButton(
+                                    iconName: iconName,
+                                    colorName: selectedColor,
+                                    isSelected: selectedIcon == iconName
+                                ) {
+                                    selectedIcon = iconName
+                                }
+                            }
                         }
+                        .padding(.vertical, 6)
                     }
 
+                    LazyVGrid(columns: columns, spacing: 12) {
+                        ForEach(BudgetCategory.tagColorNames, id: \.self) { colorName in
+                            TagColorButton(
+                                colorName: colorName,
+                                isSelected: selectedColor == colorName
+                            ) {
+                                selectedColor = colorName
+                            }
+                        }
+                    }
+                    .padding(.vertical, 6)
+
                     Button {
-                        store.addTag(name: newTagName, colorName: selectedColor)
+                        store.addTag(name: newTagName, icon: selectedIcon, colorName: selectedColor)
                         newTagName = ""
                     } label: {
                         Label("Add Tag", systemImage: "plus")
@@ -459,6 +783,62 @@ struct TagManagerView: View {
                 }
             }
         }
+    }
+}
+
+struct TagIconButton: View {
+    let iconName: String
+    let colorName: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: iconName)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(isSelected ? .white : BudgetCategory.tint(for: colorName))
+                .frame(width: 42, height: 42)
+                .background {
+                    Circle()
+                        .fill(isSelected ? BudgetCategory.tint(for: colorName) : BudgetCategory.tint(for: colorName).opacity(0.16))
+                }
+                .overlay {
+                    Circle()
+                        .strokeBorder(isSelected ? Color.primary.opacity(0.22) : Color.secondary.opacity(0.18), lineWidth: 1)
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(iconName.replacingOccurrences(of: ".", with: " "))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+struct TagColorButton: View {
+    let colorName: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Circle()
+                .fill(BudgetCategory.tint(for: colorName))
+                .frame(width: 34, height: 34)
+                .overlay {
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white)
+                            .shadow(radius: 1)
+                    }
+                }
+                .overlay {
+                    Circle()
+                        .strokeBorder(isSelected ? Color.primary : Color.secondary.opacity(0.25), lineWidth: isSelected ? 3 : 1)
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(BudgetCategory.displayName(for: colorName))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
